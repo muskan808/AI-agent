@@ -1,0 +1,488 @@
+SOLIDITY SECURITY ASSESSMENT
+============================
+
+Scope
+-----
+Files reviewed:
+	- Token.sol
+	- MemeCoin.sol
+	- Airdrop.sol
+	- Presale.sol
+	- DevFund.sol
+	- Liquidity.sol
+	- assessment.txt
+
+Executive summary
+------------------
+The project is intended to launch a MEME token with an airdrop, presale,
+development vesting fund, and liquidity module. The implementation is not a
+safe ERC-20 system and the modules are not properly access-controlled.
+
+The most serious issues are:
+	1. Anyone can mint unlimited tokens.
+	2. transferFrom() ignores allowances, so anyone can move tokens from any
+		 address that has a balance.
+	3. The presale does not require the buyer to send the calculated ETH.
+	4. Initialization and administrative operations can be called by anyone and
+		 can generally be repeated.
+	5. Airdrop users can claim repeatedly.
+	6. The airdrop and development fund are not funded with tokens by bootstrap.
+	7. The liquidity module does not transfer tokens or validate payment.
+	8. ETH received by the system has no withdrawal mechanism.
+
+
+
+
+1. Token.sol
+============
+
+Purpose
+-------
+Token.sol attempts to implement a simple ERC-20-like token called MemeCoin
+(MEME) with 9 decimals. It stores balances, allowances, total supply, and an
+authority address.
+
+Functions
+---------
+initialize(_totalSupply)
+	Creates the initial supply and assigns it to the caller.
+
+mint(to, amount)
+	Creates new tokens and assigns them to an address.
+
+approve(spender, amount)
+	Records an allowance for a spender.
+
+transfer(to, amount)
+	Moves tokens from msg.sender to another address.
+
+transferFrom(from, to, amount)
+	Is intended to move tokens using an allowance.
+
+Findings
+--------
+
+TOKEN-01 - CRITICAL - Unrestricted token minting
+The mint() function is external and has no access-control check. Any account
+can create any number of tokens for itself or another account. This defeats
+the token supply, presale cap, airdrop allocation, and all other tokenomics.
+
+Impact:
+	An attacker can inflate supply without limit and make the token worthless.
+
+Fix:
+	Restrict minting to a trusted minter or a controlled module. Prefer a
+	standard audited OpenZeppelin ERC20 implementation and explicitly define a
+	capped supply or role-based minting policy.
+
+TOKEN-02 - CRITICAL - transferFrom() does not check allowances
+transferFrom() never reads allowance[from][msg.sender] and never decreases an
+allowance. Any caller can transfer tokens out of any address with a sufficient
+balance.
+
+Impact:
+	Any token holder can have their entire balance stolen by any other account.
+
+Fix:
+	Enforce allowance[from][msg.sender] >= amount, decrease it unless it is the
+	intended infinite allowance, and emit the normal ERC-20 events. Use a
+	standard audited ERC-20 implementation instead of reimplementing this logic.
+
+TOKEN-03 - HIGH - initialize() can be called repeatedly
+initialize() has no one-time guard. Every call replaces totalSupply and gives
+the new supply to the caller, while old balances are not cleared.
+
+Impact:
+	Attackers can repeatedly reset the reported supply and allocate new tokens.
+
+Fix:
+	Use a one-time initializer guard or initialize the token in its constructor.
+	Validate the intended deployer or factory address.
+
+TOKEN-04 - MEDIUM - authority is not used
+The authority variable records an address but no function checks it.
+
+Impact:
+	The apparent administrator has no actual administrative protection.
+
+Fix:
+	Add explicit role checks or remove the unused variable. Prefer a tested
+	access-control library.
+
+TOKEN-05 - MEDIUM - Not a complete ERC-20 implementation
+The contract lacks common ERC-20 protections and compatibility details,
+including zero-address validation and allowance race-condition handling.
+
+Fix:
+	Use OpenZeppelin ERC20 unless there is a strong reason not to. Add tests for
+	transfers, approvals, transferFrom, minting, zero addresses, and supply.
+
+
+2. MemeCoin.sol
+===============
+
+Purpose
+-------
+MemeCoin is the root contract. Its constructor deploys Token, Airdrop,
+Presale, DevFund, and Liquidity contracts. bootstrap() attempts to initialize
+all of them.
+
+Functions
+---------
+constructor()
+	Deploys the child contracts and records an owner.
+
+bootstrap(totalSupply)
+	Initializes the token, configures the airdrop, initializes the presale,
+	starts the development allocation, and initializes liquidity.
+
+receive()
+	Allows the contract to receive ETH.
+
+Findings
+--------
+
+MEME-01 - HIGH - owner uses tx.origin
+The constructor assigns owner = tx.origin rather than msg.sender.
+
+Impact:
+	If deployment is initiated through another contract, ownership is assigned
+	to the external transaction origin rather than the immediate deployer. Using
+	tx.origin also creates phishing and authorization risks when used for access
+	control.
+
+Fix:
+	Use msg.sender and do not use tx.origin for authorization decisions.
+
+MEME-02 - CRITICAL - bootstrap() is unrestricted and repeatable
+Anyone can call bootstrap(), and there is no initialized flag. It calls child
+initializers and resets or overwrites important state.
+
+Impact:
+	An attacker can control initialization order and parameters, reset the
+	token supply, reset vesting, and reset liquidity accounting.
+
+Fix:
+	Restrict bootstrap to the intended owner/factory and make it callable only
+	once. Validate all allocations and ensure each child contract is initialized
+	exactly once.
+
+MEME-03 - HIGH - Child contracts are not funded
+bootstrap() configures token amounts but does not transfer tokens from the
+Token contract to Airdrop, DevFund, or Liquidity. The initial token balance is
+assigned to the caller of Token.initialize(), which is MemeCoin, not the child
+contracts.
+
+Impact:
+	Airdrop and vesting transfers can fail because those contracts have no token
+	balance. Liquidity has no token inventory at all.
+
+Fix:
+	Define the allocation plan, transfer or mint tokens to each module explicitly,
+	and verify balances during initialization.
+
+MEME-04 - MEDIUM - ETH can become trapped
+The receive() function accepts ETH, but there is no withdrawal or forwarding
+function.
+
+Impact:
+	ETH sent directly to MemeCoin cannot be recovered through the contract.
+
+Fix:
+	Add a restricted withdrawal/forwarding function with events, or remove the
+	receive function if direct ETH deposits are not intended.
+
+
+3. Airdrop.sol
+==============
+
+Purpose
+-------
+Airdrop is intended to distribute a fixed token allocation to whitelisted
+addresses during a time window.
+
+Functions
+---------
+initialize(totalTokens, startTime, duration)
+	Sets the airdrop schedule and allocation.
+
+whitelistUser()
+	Whitelists the caller.
+
+distributeAirdrop(recipient)
+	Sends the current equal share to a whitelisted recipient.
+
+Findings
+--------
+
+AIR-01 - HIGH - initialize() is unrestricted and repeatable
+Any address can set the schedule, token amount, and start time. It can also be
+called repeatedly.
+
+Impact:
+	An attacker can replace the intended airdrop configuration or reset its
+	accounting.
+
+Fix:
+	Restrict initialization to the trusted deployer/factory and add a one-time
+	initialization guard.
+
+AIR-02 - HIGH - A recipient can claim repeatedly
+distributeAirdrop() checks only whether the recipient is whitelisted. It does
+not mark the recipient as having claimed.
+
+Impact:
+	A single whitelisted address can call the function repeatedly and consume
+	the allocation intended for other users.
+
+Fix:
+	Add a claimed mapping and reject a second claim. Calculate each user's
+	allocation according to a fixed snapshot or explicitly documented policy.
+
+AIR-03 - HIGH - Anyone can whitelist themselves
+whitelistUser() has no authority or eligibility check.
+
+Impact:
+	The whitelist is not controlled and sybil accounts can change the token
+	amount per user.
+
+Fix:
+	Use an owner-controlled whitelist, Merkle proof, signature authorization, or
+	another documented eligibility mechanism.
+
+AIR-04 - MEDIUM - Allocation changes as whitelistCount changes
+tokensPerUser is calculated from the current whitelistCount on every claim.
+New whitelist entries reduce the amount available to later claimants, while
+earlier claimants may have received a larger amount.
+
+Fix:
+	Freeze the eligible set before claims, or assign a fixed amount per address.
+
+AIR-05 - HIGH - Airdrop may have no tokens to transfer
+The contract calls token.transfer(), but bootstrap() does not send tokens to
+this contract.
+
+Impact:
+	Claims revert due to insufficient balance unless tokens are funded separately.
+
+Fix:
+	Fund the contract before opening claims and verify the funding transaction.
+
+AIR-06 - LOW - Remainder tokens are not handled explicitly
+Integer division can leave a remainder when totalTokens is not evenly divisible
+by whitelistCount.
+
+Fix:
+	Define who receives the remainder or track it for a controlled final claim.
+
+
+4. Presale.sol
+==============
+
+Purpose
+-------
+Presale is intended to sell tokens for ETH using three price tiers based on
+the amount sold.
+
+Functions
+---------
+initialize()
+	Currently does nothing.
+
+buyTokens(amount)
+	Calculates a price, mints tokens to the buyer, and updates totalSold.
+
+Findings
+--------
+
+SALE-01 - CRITICAL - The presale does not require payment
+The function calculates totalCost but never compares it with msg.value. It
+checks msg.sender.balance instead, which only shows the buyer's wallet balance
+and does not prove that payment was sent to this contract.
+
+Impact:
+	Anyone can receive presale tokens for free. This destroys the sale economics.
+
+Fix:
+	Require msg.value >= totalCost, handle excess ETH deliberately, and add a
+	restricted withdrawal/forwarding mechanism for collected funds.
+
+SALE-02 - CRITICAL - Presale relies on unrestricted minting
+buyTokens() calls token.mint(), but Token.mint() is callable by everyone.
+
+Impact:
+	The sale cap can be bypassed directly through Token.mint().
+
+Fix:
+	Make the presale a controlled minter with a hard cap, or transfer a funded
+	inventory of tokens instead of minting.
+
+SALE-03 - HIGH - A purchase can cross a price tier incorrectly
+The price is selected using totalSold before the purchase. A large purchase
+that crosses a tier is charged entirely at the starting tier price.
+
+Fix:
+	Split the purchase across tiers and calculate each tier's cost, or enforce a
+	maximum amount per purchase that cannot cross a tier.
+
+SALE-04 - MEDIUM - No explicit maximum amount check
+The code updates totalSold after minting but does not reject an amount that
+causes the sale to exceed 150 billion tokens.
+
+Impact:
+	A purchase can exceed the stated sale cap, depending on the starting tier.
+
+Fix:
+	Require amount <= saleCap - totalSold before minting.
+
+SALE-05 - MEDIUM - initialize() has no purpose or protection
+The empty external function suggests initialization exists but enforces no
+state or access policy.
+
+Fix:
+	Remove it or use a guarded initializer for explicit sale configuration.
+
+
+5. DevFund.sol
+==============
+
+Purpose
+-------
+DevFund is intended to release 100 billion tokens gradually over 24 months.
+
+Functions
+---------
+allocateTokens(amount)
+	Sets the allocation and starts or resets vesting.
+
+releaseTokens(recipient)
+	Computes vested tokens and sends the newly releasable amount.
+
+Findings
+--------
+
+DEV-01 - HIGH - Anyone can allocate or reset the fund
+allocateTokens() is external with no access-control or one-time guard.
+
+Impact:
+	Any user can change the allocation, reset totalReleased, and restart vesting.
+
+Fix:
+	Restrict allocation to the authorized administrator and initialize once.
+
+DEV-02 - HIGH - Anyone chooses the release recipient
+releaseTokens() accepts any recipient and has no authorization requirement.
+
+Impact:
+	Any account can redirect vested tokens to an arbitrary address. This may be
+	intended as a permissionless beneficiary claim, but it must be explicit and
+	safe; otherwise restrict it to the beneficiary or authorized administrator.
+
+DEV-03 - HIGH - The contract is not funded
+bootstrap() sets accounting values but does not transfer tokens to DevFund.
+
+Impact:
+	releaseTokens() cannot deliver tokens from the contract's balance.
+
+Fix:
+	Transfer the allocation to DevFund before vesting begins and verify balance.
+
+DEV-04 - MEDIUM - Month calculation is incorrect
+elapsedMonths divides by 365 days, treating one year as one month. The actual
+vesting period therefore lasts 24 years, not 24 months.
+
+Fix:
+	Use a documented month duration, such as 30 days, or calculate vesting using
+	a 24-month schedule with a total duration of 730 days.
+
+DEV-05 - MEDIUM - totalAllocated is not used as the release cap
+The releasable amount is based on the constant TOKENS_PER_MONTH and the fixed
+24-month limit, not on totalAllocated. An administrator can set a smaller
+allocation while the release formula still targets the fixed amount.
+
+Fix:
+	Calculate vested amount from totalAllocated and cap it at totalAllocated.
+
+DEV-06 - LOW - Integer division leaves undistributed tokens
+100,000,000,000 / 24 is rounded down. The remainder is not released.
+
+Fix:
+	Release the remainder in the final period or calculate the final amount as
+	totalAllocated - totalReleased.
+
+
+6. Liquidity.sol
+================
+
+Purpose
+-------
+Liquidity is described as tracking MEME tokens sold into a liquidity pool.
+
+Functions
+---------
+initialize(totalLiquidity)
+	Sets the available liquidity amount.
+
+purchaseTokens(amount, price)
+	Decreases totalLiquidity and increases soldTokens.
+
+Findings
+--------
+
+LIQ-01 - HIGH - initialize() is unrestricted and repeatable
+Anyone can set or reset the liquidity amount and owner.
+
+Fix:
+	Restrict initialization and make it one-time.
+
+LIQ-02 - CRITICAL - purchaseTokens() does not transfer tokens
+The function only updates accounting. It does not send tokens to the buyer.
+
+Impact:
+	Users can pay, if payment were checked, without receiving the purchased
+	asset. The function is not a working token sale.
+
+Fix:
+	Transfer tokens after validating payment, or integrate with a properly
+	audited liquidity-pool contract.
+
+LIQ-03 - CRITICAL - Payment and price are ignored
+The price parameter is unused and msg.value is never checked.
+
+Impact:
+	Users can call the function without paying the required amount. Any ETH sent
+	is not accounted for or withdrawable.
+
+Fix:
+	Define the pricing model, require the correct msg.value, handle overpayment,
+	and provide controlled withdrawal of proceeds.
+
+LIQ-04 - MEDIUM - Anyone can consume the tracked liquidity
+There is no authorization or payment requirement around purchaseTokens().
+
+Impact:
+	An attacker can reduce totalLiquidity and inflate soldTokens without making
+	a valid purchase.
+
+Fix:
+	Enforce the purchase conditions and use access control where appropriate.
+
+
+7. assessment.txt
+=================
+
+
+
+Recommended remediation order
+------------------------------
+1. Replace Token.sol with a standard audited ERC-20 implementation.
+2. Add one-time initialization and role-based access control everywhere.
+3. Fix minting and allowance enforcement before testing other modules.
+4. Correct presale payment validation, tier handling, and sale-cap checks.
+5. Fix airdrop eligibility, claim tracking, funding, and allocation rules.
+6. Fix vesting duration, funding, recipient authorization, and final remainder.
+7. Replace the placeholder Liquidity module with a real audited design.
+8. Add unit tests, invariant tests, static analysis such as Slither, and a
+	 compiler build with warnings treated seriously.
+9. Test ETH deposits, withdrawals, failed transfers, reentrancy boundaries,
+	 authorization, and repeated initialization before any deployment.
